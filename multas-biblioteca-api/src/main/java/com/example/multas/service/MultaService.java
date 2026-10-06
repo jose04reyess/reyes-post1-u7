@@ -1,0 +1,91 @@
+package com.example.multas.service;
+
+import com.example.multas.domain.PagoRechazadoException;
+import com.example.multas.domain.ResultadoPago;
+import com.example.multas.domain.port.PasarelaPagoPort;
+import com.example.multas.model.EstadoMulta;
+import com.example.multas.model.LimiteMultasPendientesException;
+import com.example.multas.model.Multa;
+import com.example.multas.model.MultaNotFoundException;
+import com.example.multas.model.MultaYaPagadaException;
+import com.example.multas.repository.MultaRepository;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.math.BigDecimal;
+import java.time.LocalDate;
+import java.util.List;
+
+@Service
+@Transactional
+public class MultaService {
+
+    public static final int LIMITE_MULTAS_PENDIENTES = 3;
+
+    private final MultaRepository multaRepository;
+    private final PasarelaPagoPort pasarelaPagoPort;
+
+    public MultaService(MultaRepository multaRepository, PasarelaPagoPort pasarelaPagoPort) {
+        this.multaRepository = multaRepository;
+        this.pasarelaPagoPort = pasarelaPagoPort;
+    }
+
+    @Transactional(readOnly = true)
+    public List<Multa> listarTodas() {
+        return multaRepository.findAll();
+    }
+
+    @Transactional(readOnly = true)
+    public List<Multa> listarPorEstudiante(String estudianteId) {
+        return multaRepository.findByEstudianteId(estudianteId);
+    }
+
+    @Transactional(readOnly = true)
+    public Multa buscarPorId(Long id) {
+        return multaRepository.findById(id)
+                .orElseThrow(() -> new MultaNotFoundException("No se encontró la multa con ID: " + id));
+    }
+
+    public Multa generar(String estudianteId, String concepto, int diasAtraso) {
+        long multasPendientes = multaRepository.countByEstudianteIdAndEstado(estudianteId, EstadoMulta.PENDIENTE);
+        if (multasPendientes >= LIMITE_MULTAS_PENDIENTES) {
+            throw new LimiteMultasPendientesException(
+                    "El estudiante " + estudianteId + " ha alcanzado el límite máximo de " +
+                    LIMITE_MULTAS_PENDIENTES + " multas pendientes.");
+        }
+
+        BigDecimal monto = Multa.calcularMonto(diasAtraso);
+        Multa nuevaMulta = new Multa(
+                estudianteId,
+                concepto,
+                diasAtraso,
+                monto,
+                EstadoMulta.PENDIENTE,
+                LocalDate.now()
+        );
+
+        return multaRepository.save(nuevaMulta);
+    }
+
+    public Multa pagarEnVentanilla(Long id) {
+        Multa multa = buscarPorId(id);
+        multa.marcarComoPagada("VENTANILLA");
+        return multaRepository.save(multa);
+    }
+
+    public Multa pagarConPasarela(Long id) {
+        Multa multa = buscarPorId(id);
+        if (multa.getEstado() == EstadoMulta.PAGADA) {
+            throw new MultaYaPagadaException("La multa con ID " + id + " ya se encuentra pagada.");
+        }
+
+        ResultadoPago resultado = pasarelaPagoPort.procesar(multa);
+        if (!resultado.exitoso()) {
+            throw new PagoRechazadoException("Pago rechazado por " + resultado.proveedor() + ": " + resultado.mensaje());
+        }
+
+        String metodoPago = resultado.proveedor();
+        multa.marcarComoPagada(metodoPago);
+        return multaRepository.save(multa);
+    }
+}
